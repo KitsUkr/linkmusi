@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import time
 from dataclasses import asdict
@@ -7,10 +8,10 @@ from pathlib import Path
 from .models import TrackInfo
 
 CACHE_TTL = 24 * 60 * 60
-# Неповні картки (без якоїсь із основних платформ) кешуємо ненадовго,
-# щоб наступний запит мав шанс дозаповнити їх.
 SHORT_TTL = 60 * 60
-DB_PATH = Path(__file__).resolve().parent.parent / "cache.db"
+DB_PATH = Path(
+    os.getenv("CACHE_DB_PATH") or Path(__file__).resolve().parent.parent / "cache.db"
+)
 
 _conn: sqlite3.Connection | None = None
 
@@ -18,7 +19,10 @@ _conn: sqlite3.Connection | None = None
 def _connection() -> sqlite3.Connection:
     global _conn
     if _conn is None:
-        _conn = sqlite3.connect(DB_PATH)
+        _conn = sqlite3.connect(DB_PATH, timeout=10)
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA synchronous=NORMAL")
+        _conn.execute("PRAGMA busy_timeout=10000")
         _conn.execute(
             "CREATE TABLE IF NOT EXISTS tracks ("
             "url TEXT PRIMARY KEY, fetched_at REAL NOT NULL, "

@@ -1,0 +1,13 @@
+services:
+  musicbot:
+    container_name: musicbot
+    restart: unless-stopped
+    build: .
+    image: musicbot:latest
+    env_file:
+      - .env
+    environment:
+      # SQLite-кеш лежить у змонтованому томі, щоб переживав перезапуски.
+      - CACHE_DB_PATH=/app/data/cache.db
+    volumes:
+      - ./data:/app/data

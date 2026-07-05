@@ -1,0 +1,13 @@
+.env
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+data/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
