@@ -1,9 +1,12 @@
+import json
 import logging
-from urllib.parse import parse_qs, urlsplit
+import re
+from urllib.parse import parse_qs, quote, urlsplit
 
 import aiohttp
 
 from . import cache
+from .config import ODESLI_API_KEY as API_KEY
 from .duration import fetch_duration
 from .enrich import enrich_links, improve_thumbnail
 from .models import MAIN_PLATFORMS, TrackInfo
@@ -11,6 +14,9 @@ from .models import MAIN_PLATFORMS, TrackInfo
 log = logging.getLogger(__name__)
 
 API_URL = "https://api.song.link/v1-alpha.1/links"
+PAGE_URL = "https://song.link/"
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
+_WEB_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 
 class RateLimitError(Exception):
@@ -33,8 +39,14 @@ def normalize_url(url: str) -> str:
 
 
 async def _request_odesli(url: str) -> dict | None:
-    params = {"url": url, "userCountry": "UA", "songIfSingle": "true"}
-    async with aiohttp.ClientSession() as session:
+    if API_KEY:
+        return await _request_api(url)
+    return await _request_page(url)
+
+
+async def _request_api(url: str) -> dict | None:
+    params = {"url": url, "userCountry": "UA", "songIfSingle": "true", "key": API_KEY}
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
         async with session.get(API_URL, params=params) as resp:
             if resp.status == 429:
                 raise RateLimitError
@@ -42,6 +54,58 @@ async def _request_odesli(url: str) -> dict | None:
                 return None
             resp.raise_for_status()
             return await resp.json()
+
+
+# З 31.07.2026 публічний API без ключа відповідає 401 PUBLIC_API_ACCESS_DEPRECATED.
+# Сторінка song.link/<url> віддає ті самі дані в __NEXT_DATA__ — перекладаємо
+# їх у формат відповіді API, щоб решта коду не змінювалась.
+_NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+
+
+async def _request_page(url: str) -> dict | None:
+    page_url = PAGE_URL + quote(url, safe="")
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=_WEB_HEADERS) as session:
+        async with session.get(page_url) as resp:
+            if resp.status == 429:
+                raise RateLimitError
+            if resp.status in (400, 404):
+                return None
+            resp.raise_for_status()
+            html = await resp.text()
+
+    match = _NEXT_DATA_RE.search(html)
+    if not match:
+        raise ValueError("На сторінці song.link немає __NEXT_DATA__ — змінилась розмітка?")
+    page_data = json.loads(match.group(1)).get("props", {}).get("pageProps", {}).get("pageData")
+    if not page_data or not page_data.get("entityData"):
+        return None
+    return _page_to_api(page_data)
+
+
+def _page_to_api(page_data: dict) -> dict:
+    entity_id = page_data.get("entityUniqueId")
+    entity = dict(page_data["entityData"])
+    entity["apiProvider"] = entity.get("provider")
+    entities = {entity_id: entity}
+    links: dict[str, dict] = {}
+    for section in page_data.get("sections") or []:
+        for link in section.get("links") or []:
+            platform, link_url = link.get("platform"), link.get("url")
+            if not platform or not link_url:
+                continue
+            links.setdefault(platform, {"url": link_url})
+            # uniqueId має вигляд "deezer|song|781592622" — з нього fetch_duration
+            # бере id треку в Deezer/iTunes.
+            unique_id = link.get("uniqueId") or ""
+            provider, _, provider_id = unique_id.partition("|song|")
+            if provider_id and unique_id not in entities:
+                entities[unique_id] = {"apiProvider": provider, "id": provider_id}
+    return {
+        "entityUniqueId": entity_id,
+        "entitiesByUniqueId": entities,
+        "linksByPlatform": links,
+        "pageUrl": page_data.get("pageUrl", ""),
+    }
 
 
 async def fetch_track(url: str) -> TrackInfo | None:
