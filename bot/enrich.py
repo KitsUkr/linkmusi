@@ -359,12 +359,15 @@ async def _add_spotify(track: "TrackInfo") -> None:
     if time.time() < _spotify_blocked_until:
         return
     session = get_session()
-    token = await _get_spotify_token(session)
+    # Токен і ISRC не залежать один від одного — запитуємо паралельно.
+    token, isrc = await asyncio.gather(
+        _get_spotify_token(session),
+        _deezer_isrc(session, track.links.get("deezer")),
+    )
     if not token:
         return
     headers = {"Authorization": f"Bearer {token}"}
     # ISRC (міжнародний код запису) — точний збіг без евристик.
-    isrc = await _deezer_isrc(session, track.links.get("deezer"))
     queries = ([f"isrc:{isrc}"] if isrc else []) + [_search_query(track)]
     for query in queries:
         data = await _spotify_search(session, headers, query)

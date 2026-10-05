@@ -56,6 +56,12 @@ RATE_LIMIT_TEXT = "Забагато запитів, сервіс пошуку п
 ERROR_TEXT = "Щось пішло не так під час пошуку треку. Спробуй ще раз трохи згодом."
 
 
+def _consume_exception(task: asyncio.Task) -> None:
+    # Фонові задачі без await: забираємо виняток, щоб не було warning'а.
+    if not task.cancelled():
+        task.exception()
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(START_TEXT)
@@ -72,7 +78,11 @@ async def handle_link(message: Message) -> None:
         return
 
     url = match.group(0)
-    await message.bot.send_chat_action(message.chat.id, "upload_photo")
+    # Індикатор "надсилає фото" — у фоні, щоб не затримувати пошук.
+    action = asyncio.create_task(
+        message.bot.send_chat_action(message.chat.id, "upload_photo")
+    )
+    action.add_done_callback(_consume_exception)
 
     try:
         track = await fetch_track(url)
@@ -125,7 +135,7 @@ async def inline_link(query: InlineQuery) -> None:
     done, _ = await asyncio.wait({task}, timeout=INLINE_TIMEOUT_SEC)
     if not done:
         # Збір триває у фоні й ляже в кеш — повторна спроба буде миттєвою.
-        task.add_done_callback(lambda t: t.exception())
+        task.add_done_callback(_consume_exception)
         await _answer_inline(query, [], cache_time=5)
         return
 

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -103,12 +104,26 @@ def _page_to_api(page_data: dict) -> dict:
     }
 
 
+# Одночасні запити з однаковим посиланням (inline + чат, два користувачі)
+# чекають на спільну задачу замість повторного циклу звернень до Odesli.
+_inflight: dict[str, asyncio.Task] = {}
+
+
 async def fetch_track(url: str) -> TrackInfo | None:
     url = normalize_url(url)
     hit, cached_track = cache.get(url)
     if hit:
         return cached_track
 
+    task = _inflight.get(url)
+    if task is None:
+        task = asyncio.create_task(_fetch_track_uncached(url))
+        _inflight[url] = task
+        task.add_done_callback(lambda _: _inflight.pop(url, None))
+    return await asyncio.shield(task)
+
+
+async def _fetch_track_uncached(url: str) -> TrackInfo | None:
     data = await _request_odesli(url)
     if data is None:
         cache.put(url, None)
@@ -117,10 +132,18 @@ async def fetch_track(url: str) -> TrackInfo | None:
     track = _parse_response(data)
     ttl = cache.CACHE_TTL
     if track is not None:
+        # Другий запит до Odesli (~1 с) не залежить від тривалості й пошуку
+        # відсутніх платформ — запускаємо паралельно з ними.
+        merge_task = None
+        if "spotify" not in track.links:
+            merge_task = asyncio.create_task(_merge_missing_platforms(track))
         track.duration_sec = await fetch_duration(data)
         await enrich_links(track)
-        if "spotify" not in track.links:
-            await _merge_missing_platforms(track)
+        if merge_task is not None:
+            try:
+                await merge_task
+            except Exception:
+                log.warning("Злиття платформ не вдалося — йдемо без нього", exc_info=True)
         await improve_thumbnail(track)
         if any(platform not in track.links for platform in MAIN_PLATFORMS):
             ttl = cache.SHORT_TTL

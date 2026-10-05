@@ -21,7 +21,7 @@ def get_session() -> aiohttp.ClientSession:
         _session = aiohttp.ClientSession(
             timeout=TIMEOUT,
             headers=WEB_HEADERS,
-            connector=aiohttp.TCPConnector(ssl=_SSL_CONTEXT),
+            connector=aiohttp.TCPConnector(ssl=_SSL_CONTEXT, ttl_dns_cache=300),
         )
     return _session
 
