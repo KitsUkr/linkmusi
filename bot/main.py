@@ -8,6 +8,7 @@ from aiogram.enums import ParseMode
 if __package__:
     from .config import BOT_TOKEN
     from .handlers import router
+    from .http import close_session
 else:
     import os
     import sys
@@ -15,6 +16,7 @@ else:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from bot.config import BOT_TOKEN
     from bot.handlers import router
+    from bot.http import close_session
 
 
 async def main() -> None:
@@ -25,7 +27,10 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await close_session()
 
 
 if __name__ == "__main__":

@@ -3,20 +3,17 @@ import logging
 import re
 from urllib.parse import parse_qs, quote, urlsplit
 
-import aiohttp
-
 from . import cache
 from .config import ODESLI_API_KEY as API_KEY
 from .duration import fetch_duration
 from .enrich import enrich_links, improve_thumbnail
+from .http import get_session
 from .models import MAIN_PLATFORMS, TrackInfo
 
 log = logging.getLogger(__name__)
 
 API_URL = "https://api.song.link/v1-alpha.1/links"
 PAGE_URL = "https://song.link/"
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
-_WEB_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 
 class RateLimitError(Exception):
@@ -46,14 +43,13 @@ async def _request_odesli(url: str) -> dict | None:
 
 async def _request_api(url: str) -> dict | None:
     params = {"url": url, "userCountry": "UA", "songIfSingle": "true", "key": API_KEY}
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
-        async with session.get(API_URL, params=params) as resp:
-            if resp.status == 429:
-                raise RateLimitError
-            if resp.status in (400, 404):
-                return None
-            resp.raise_for_status()
-            return await resp.json()
+    async with get_session().get(API_URL, params=params) as resp:
+        if resp.status == 429:
+            raise RateLimitError
+        if resp.status in (400, 404):
+            return None
+        resp.raise_for_status()
+        return await resp.json()
 
 
 # З 31.07.2026 публічний API без ключа відповідає 401 PUBLIC_API_ACCESS_DEPRECATED.
@@ -64,14 +60,13 @@ _NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re
 
 async def _request_page(url: str) -> dict | None:
     page_url = PAGE_URL + quote(url, safe="")
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=_WEB_HEADERS) as session:
-        async with session.get(page_url) as resp:
-            if resp.status == 429:
-                raise RateLimitError
-            if resp.status in (400, 404):
-                return None
-            resp.raise_for_status()
-            html = await resp.text()
+    async with get_session().get(page_url) as resp:
+        if resp.status == 429:
+            raise RateLimitError
+        if resp.status in (400, 404):
+            return None
+        resp.raise_for_status()
+        html = await resp.text()
 
     match = _NEXT_DATA_RE.search(html)
     if not match:

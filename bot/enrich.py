@@ -1,13 +1,13 @@
 import asyncio
 import logging
 import re
-import ssl
 import time
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 
 import aiohttp
-import certifi
+
+from .http import get_session
 
 if TYPE_CHECKING:
     from .models import TrackInfo
@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 DURATION_TOLERANCE_SEC = 7
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 _ytmusic = None
 
 
@@ -101,14 +100,13 @@ def _search_ytmusic(query: str) -> list[dict]:
 
 
 async def _add_deezer(track: "TrackInfo") -> None:
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
-        async with session.get(
-            "https://api.deezer.com/search",
-            params={"q": _search_query(track), "limit": "5"},
-        ) as resp:
-            if resp.status != 200:
-                return
-            data = await resp.json()
+    async with get_session().get(
+        "https://api.deezer.com/search",
+        params={"q": _search_query(track), "limit": "5"},
+    ) as resp:
+        if resp.status != 200:
+            return
+        data = await resp.json()
 
     for item in data.get("data", []):
         url = item.get("link")
@@ -129,11 +127,10 @@ async def _add_apple_music(track: "TrackInfo") -> None:
         "entity": "song",
         "limit": "5",
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.get("https://itunes.apple.com/search", params=params) as resp:
-            if resp.status != 200:
-                return
-            data = await resp.json(content_type=None)
+    async with get_session().get("https://itunes.apple.com/search", params=params) as resp:
+        if resp.status != 200:
+            return
+        data = await resp.json(content_type=None)
 
     for item in data.get("results", []):
         url = item.get("trackViewUrl")
@@ -184,18 +181,18 @@ async def _get_soundcloud_client_id(session: aiohttp.ClientSession, force: bool 
 
 async def _add_soundcloud(track: "TrackInfo") -> None:
     query = _search_query(track)
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
-        client_id = await _get_soundcloud_client_id(session)
+    session = get_session()
+    client_id = await _get_soundcloud_client_id(session)
+    if not client_id:
+        return
+    data = await _search_soundcloud(session, query, client_id)
+    if data is None:
+        client_id = await _get_soundcloud_client_id(session, force=True)
         if not client_id:
             return
         data = await _search_soundcloud(session, query, client_id)
-        if data is None:
-            client_id = await _get_soundcloud_client_id(session, force=True)
-            if not client_id:
-                return
-            data = await _search_soundcloud(session, query, client_id)
-        if data is None:
-            return
+    if data is None:
+        return
 
     duration_fallback: str | None = None
     for item in data.get("collection", []):
@@ -272,22 +269,16 @@ async def _deezer_cover(deezer_url: str) -> str | None:
     match = _DEEZER_TRACK_ID_RE.search(deezer_url)
     if not match:
         return None
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
-        async with session.get(f"https://api.deezer.com/track/{match.group(1)}") as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
+    async with get_session().get(f"https://api.deezer.com/track/{match.group(1)}") as resp:
+        if resp.status != 200:
+            return None
+        data = await resp.json()
     album = data.get("album") or {}
     return album.get("cover_xl") or album.get("cover_big") or None
 
 
 # Безключовий пошук Spotify: embed-сторінка віддає анонімний accessToken,
 # з яким працює офіційний пошук api.spotify.com — Premium не потрібен.
-
-_WEB_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-# Системне сховище сертифікатів Windows не знає ланцюжок open.spotify.com —
-# використовуємо CA-бандл certifi.
-_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 _SPOTIFY_TOKEN_RE = re.compile(r'"accessToken":"([^"]+)"')
 _SPOTIFY_TOKEN_EXP_RE = re.compile(r'"accessTokenExpirationTimestampMs":(\d+)')
@@ -367,36 +358,32 @@ async def _deezer_isrc(session: aiohttp.ClientSession, deezer_url: str | None) -
 async def _add_spotify(track: "TrackInfo") -> None:
     if time.time() < _spotify_blocked_until:
         return
-    async with aiohttp.ClientSession(
-        timeout=HTTP_TIMEOUT,
-        headers=_WEB_HEADERS,
-        connector=aiohttp.TCPConnector(ssl=_SSL_CONTEXT),
-    ) as session:
-        token = await _get_spotify_token(session)
-        if not token:
+    session = get_session()
+    token = await _get_spotify_token(session)
+    if not token:
+        return
+    headers = {"Authorization": f"Bearer {token}"}
+    # ISRC (міжнародний код запису) — точний збіг без евристик.
+    isrc = await _deezer_isrc(session, track.links.get("deezer"))
+    queries = ([f"isrc:{isrc}"] if isrc else []) + [_search_query(track)]
+    for query in queries:
+        data = await _spotify_search(session, headers, query)
+        if data is None:
             return
-        headers = {"Authorization": f"Bearer {token}"}
-        # ISRC (міжнародний код запису) — точний збіг без евристик.
-        isrc = await _deezer_isrc(session, track.links.get("deezer"))
-        queries = ([f"isrc:{isrc}"] if isrc else []) + [_search_query(track)]
-        for query in queries:
-            data = await _spotify_search(session, headers, query)
-            if data is None:
+        for item in (data.get("tracks") or {}).get("items", []):
+            url = (item.get("external_urls") or {}).get("spotify")
+            if not url:
+                continue
+            artist = ", ".join(a.get("name", "") for a in item.get("artists", []))
+            millis = item.get("duration_ms")
+            duration = round(millis / 1000) if millis else None
+            if query.startswith("isrc:") or _matches(
+                track, item.get("name", ""), artist, duration
+            ):
+                track.links["spotify"] = url
+                if not track.duration_sec and duration:
+                    track.duration_sec = duration
                 return
-            for item in (data.get("tracks") or {}).get("items", []):
-                url = (item.get("external_urls") or {}).get("spotify")
-                if not url:
-                    continue
-                artist = ", ".join(a.get("name", "") for a in item.get("artists", []))
-                millis = item.get("duration_ms")
-                duration = round(millis / 1000) if millis else None
-                if query.startswith("isrc:") or _matches(
-                    track, item.get("name", ""), artist, duration
-                ):
-                    track.links["spotify"] = url
-                    if not track.duration_sec and duration:
-                        track.duration_sec = duration
-                    return
 
 
 # Слова, що вказують на іншу версію пісні. Кандидат відкидається, якщо
