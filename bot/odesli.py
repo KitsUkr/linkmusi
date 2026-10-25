@@ -123,6 +123,10 @@ async def fetch_track(url: str) -> TrackInfo | None:
     return await asyncio.shield(task)
 
 
+def _is_youtube_url(url: str) -> bool:
+    return "youtu.be/" in url or "youtube.com/watch" in url
+
+
 async def _fetch_track_uncached(url: str) -> TrackInfo | None:
     data = await _request_odesli(url)
     if data is None:
@@ -130,23 +134,37 @@ async def _fetch_track_uncached(url: str) -> TrackInfo | None:
         return None
 
     track = _parse_response(data)
-    # Odesli вважає "треком" будь-яке YouTube-відео — відео-есеї й влоги
-    # відсіюємо за категорією відео. Якщо категорію визначити не вдалося,
-    # обробляємо як раніше.
-    if track is not None and "music.youtube.com" not in url:
-        is_music = await is_music_video(url)
-        if is_music is False:
-            log.info("Відео не з категорії Music — пропускаю: %s", url)
-            cache.put(url, None)
-            return None
+    merged = False
+    if track is not None and _is_youtube_url(url):
+        # Odesli вважає "треком" будь-яке YouTube-відео. Якщо воно не
+        # зв'язане з жодною музичною платформою, відсіюємо влоги й есеї
+        # за категорією відео; категорію визначити не вдалося — йдемо далі.
+        if "music.youtube.com" not in url and all(
+            platform in ("youtube", "youtubeMusic") for platform in track.links
+        ):
+            is_music = await is_music_video(url)
+            if is_music is False:
+                log.info("Відео не з категорії Music — пропускаю: %s", url)
+                cache.put(url, None)
+                return None
+        # Метадані ролика (назва відео, канал замість виконавця) погано
+        # шукаються на інших платформах — спочатку добираємо канонічні.
+        if "spotify" not in track.links:
+            try:
+                await _merge_missing_platforms(track)
+                merged = True
+            except Exception:
+                log.warning("Злиття платформ не вдалося — йдемо без нього", exc_info=True)
     ttl = cache.CACHE_TTL
     if track is not None:
         # Другий запит до Odesli (~1 с) не залежить від тривалості й пошуку
         # відсутніх платформ — запускаємо паралельно з ними.
         merge_task = None
-        if "spotify" not in track.links:
+        if not merged and "spotify" not in track.links:
             merge_task = asyncio.create_task(_merge_missing_platforms(track))
-        track.duration_sec = await fetch_duration(data)
+        duration = await fetch_duration(data)
+        if duration is not None:
+            track.duration_sec = duration
         await enrich_links(track)
         if merge_task is not None:
             try:
@@ -162,8 +180,14 @@ async def _fetch_track_uncached(url: str) -> TrackInfo | None:
 
 async def _merge_missing_platforms(track: TrackInfo) -> None:
     """Odesli міг не зв'язати вхідне посилання з кластером пісні (типово для
-    YouTube) — повторний запит через Deezer/Apple повертає повний набір."""
-    source = track.links.get("deezer") or track.links.get("appleMusic")
+    YouTube) — повторний запит через іншу платформу повертає повний набір
+    посилань і канонічні назву з виконавцем."""
+    source = (
+        track.links.get("deezer")
+        or track.links.get("appleMusic")
+        or track.links.get("tidal")
+        or track.links.get("amazonMusic")
+    )
     if not source:
         return
     try:
@@ -173,6 +197,14 @@ async def _merge_missing_platforms(track: TrackInfo) -> None:
         return
     if not data:
         return
+    entities = data.get("entitiesByUniqueId") or {}
+    entity = entities.get(data.get("entityUniqueId"))
+    if entity is None and entities:
+        entity = next(iter(entities.values()))
+    if entity and entity.get("title"):
+        track.title = entity["title"]
+        if entity.get("artistName"):
+            track.artist = entity["artistName"]
     for platform, info in (data.get("linksByPlatform") or {}).items():
         if info.get("url"):
             track.links.setdefault(platform, info["url"])
