@@ -57,6 +57,14 @@ def _search_query(track: "TrackInfo") -> str:
 _YT_VIDEO_ID_RE = re.compile(r"(?:[?&]v=|youtu\.be/)([\w-]{11})")
 
 
+async def _fetch_song(video_id: str) -> dict | None:
+    try:
+        return await asyncio.to_thread(lambda: _get_ytmusic().get_song(video_id))
+    except Exception as e:
+        log.warning("Не вдалося отримати метадані з YouTube: %s", e)
+        return None
+
+
 async def fetch_youtube_duration(track: "TrackInfo") -> int | None:
     url = track.links.get("youtubeMusic") or track.links.get("youtube")
     if not url:
@@ -64,12 +72,27 @@ async def fetch_youtube_duration(track: "TrackInfo") -> int | None:
     match = _YT_VIDEO_ID_RE.search(url)
     if not match:
         return None
-    try:
-        song = await asyncio.to_thread(lambda: _get_ytmusic().get_song(match.group(1)))
-        return int(song["videoDetails"]["lengthSeconds"])
-    except Exception as e:
-        log.warning("Не вдалося отримати тривалість з YouTube: %s", e)
+    song = await _fetch_song(match.group(1))
+    if not song:
         return None
+    try:
+        return int(song["videoDetails"]["lengthSeconds"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+async def is_music_video(url: str) -> bool | None:
+    """True — відео в категорії Music, False — влог/есеї тощо, None — не вдалося визначити."""
+    match = _YT_VIDEO_ID_RE.search(url)
+    if not match:
+        return None
+    song = await _fetch_song(match.group(1))
+    if song is None:
+        return None
+    category = (song.get("microformat") or {}).get("microformatDataRenderer", {}).get("category")
+    if category is None:
+        return None
+    return category == "Music"
 
 
 async def _add_youtube_music(track: "TrackInfo") -> None:

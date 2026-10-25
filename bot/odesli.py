@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 from . import cache
 from .config import ODESLI_API_KEY as API_KEY
 from .duration import fetch_duration
-from .enrich import enrich_links, improve_thumbnail
+from .enrich import enrich_links, improve_thumbnail, is_music_video
 from .http import get_session
 from .models import MAIN_PLATFORMS, TrackInfo
 
@@ -130,6 +130,15 @@ async def _fetch_track_uncached(url: str) -> TrackInfo | None:
         return None
 
     track = _parse_response(data)
+    # Odesli вважає "треком" будь-яке YouTube-відео — відео-есеї й влоги
+    # відсіюємо за категорією відео. Якщо категорію визначити не вдалося,
+    # обробляємо як раніше.
+    if track is not None and "music.youtube.com" not in url:
+        is_music = await is_music_video(url)
+        if is_music is False:
+            log.info("Відео не з категорії Music — пропускаю: %s", url)
+            cache.put(url, None)
+            return None
     ttl = cache.CACHE_TTL
     if track is not None:
         # Другий запит до Odesli (~1 с) не залежить від тривалості й пошуку
